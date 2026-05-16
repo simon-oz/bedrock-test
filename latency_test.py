@@ -258,7 +258,7 @@ def run_conversational_test_suite(model_id, delay=1.0, max_retries=3):
     """Run 20 conversational test cases, return results, correct count."""
     results = []
     correct_count = 0
-    print(f"\n🧪 Testing Conversational Model: {model_id}")
+    print(f"\n[Conversational] Testing Model: {model_id}")
     print(f"   Parameter size: {get_model_parameter_size(model_id)}")
     print(f"   Total Queries: {len(CONVERSATION_TEST_CASES)}")
 
@@ -300,7 +300,7 @@ def run_conversational_test_suite(model_id, delay=1.0, max_retries=3):
             })
         if i < len(CONVERSATION_TEST_CASES) - 1:
             time.sleep(delay)
-    print(f"\n   ✅ Completed. Correct: {correct_count}/{len(CONVERSATION_TEST_CASES)}")
+    print(f"\n   Completed. Correct: {correct_count}/{len(CONVERSATION_TEST_CASES)}")
     return results, correct_count, len(CONVERSATION_TEST_CASES)
 
 # ------------------------------------------------------------------------------
@@ -317,7 +317,7 @@ def run_embedding_test_suite(model_id, test_pairs, delay=1.0, max_retries=3):
     latencies = []
     input_tokens_list = []
     
-    print(f"\n🔢 Testing Embedding Model: {model_id}")
+    print(f"\n[Embedding] Testing Model: {model_id}")
     print(f"   Total Pairs: {len(test_pairs)}")
     
     for i, (sent_a, sent_b, expected_similar) in enumerate(test_pairs):
@@ -392,7 +392,7 @@ def run_embedding_test_suite(model_id, test_pairs, delay=1.0, max_retries=3):
             time.sleep(delay)
     
     accuracy = (correct_pairs / len(test_pairs)) * 100 if test_pairs else 0
-    print(f"\n   ✅ Completed. Similarity Accuracy: {correct_pairs}/{len(test_pairs)} ({accuracy:.1f}%)")
+    print(f"\n   Completed. Similarity Accuracy: {correct_pairs}/{len(test_pairs)} ({accuracy:.1f}%)")
     return results, accuracy, latencies, input_tokens_list
 
 # ------------------------------------------------------------------------------
@@ -470,6 +470,24 @@ def print_embedding_stats(results, accuracy, latencies, input_tokens_list, model
         "total_input_tokens": sum(input_tokens_list) if input_tokens_list else 0,
     }
 
+def print_combined_summary(conv_summaries, embed_summaries):
+    """Print a combined table of all models (conversational + embedding)."""
+    print("\n" + "="*110)
+    print("FINAL SUMMARY: LATENCY & TOKEN USAGE (ap-southeast-2)")
+    print("="*110)
+    # Conversational header
+    print(f"{'Type':<12} {'Model ID':<40} {'Succ Rate':<10} {'Correct Rate':<12} {'Avg Lat (s)':<12} {'In Tokens':<10} {'Out Tokens':<10}")
+    print("-"*110)
+    for s in conv_summaries:
+        print(f"{'Conv':<12} {s['model_id']:<40} {s['successful']}/{s['total']:<9} {s['correct']}/{s['total']} ({s['correct_rate']:.1f}%)   {s['avg_latency']:<12.4f} {s['total_input_tokens']:<10} {s['total_output_tokens']:<10}")
+    # Embedding header
+    print("-"*110)
+    print(f"{'Type':<12} {'Model ID':<40} {'Succ Rate':<10} {'Similarity Acc':<14} {'Avg Lat (s)':<12} {'In Tokens':<10}")
+    print("-"*110)
+    for e in embed_summaries:
+        print(f"{'Embed':<12} {e['model_id']:<40} {e['successful']}/{e['total']:<9} {e['similarity_accuracy']:.1f}% ({e['correct_pairs']}/{e['total']})   {e['avg_latency']:<12.4f} {e['total_input_tokens']:<10}")
+    print("="*110)
+
 def write_results_to_csv(all_summaries, folder_name="experiment_results"):
     """Write all model summaries (conversational + embedding) to CSV."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -483,7 +501,6 @@ def write_results_to_csv(all_summaries, folder_name="experiment_results"):
 
     with open(filepath, mode='w', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
-        # Header differs slightly for conversational vs embedding
         writer.writerow(["Model Type", "Model ID", "Parameter Size", "Success Rate",
                          "Avg Latency (s)", "Min Latency (s)", "Max Latency (s)",
                          "Total Input Tokens", "Total Output Tokens",
@@ -519,7 +536,7 @@ def write_results_to_csv(all_summaries, folder_name="experiment_results"):
                 sim_acc,
                 correct_pairs
             ])
-    print(f"\n💾 Results saved to: {filepath}")
+    print(f"\nResults saved to: {filepath}")
 
 # ------------------------------------------------------------------------------
 # 9. Main Execution
@@ -529,7 +546,9 @@ if __name__ == "__main__":
     print("AWS BEDROCK LATENCY, TOKEN & SIMILARITY EVALUATION")
     print("(Conversational + Embedding Models)")
     print("="*70)
-    all_summaries = []
+    
+    conv_summaries = []
+    embed_summaries = []
 
     # 1. Test conversational models
     print("\n" + "="*70)
@@ -538,7 +557,7 @@ if __name__ == "__main__":
     for model_id in CONVERSATION_MODEL_IDS:
         results, correct_count, total_q = run_conversational_test_suite(model_id, REQUEST_DELAY, MAX_RETRIES)
         summary = print_conversational_stats(results, correct_count, total_q, model_id)
-        all_summaries.append(summary)
+        conv_summaries.append(summary)
 
     # 2. Test embedding models (with similarity evaluation)
     print("\n" + "="*70)
@@ -547,9 +566,13 @@ if __name__ == "__main__":
     for model_id in EMBEDDING_MODEL_IDS:
         results, accuracy, latencies, tokens_list = run_embedding_test_suite(model_id, EMBEDDING_TEST_PAIRS, REQUEST_DELAY, MAX_RETRIES)
         summary = print_embedding_stats(results, accuracy, latencies, tokens_list, model_id)
-        all_summaries.append(summary)
-
-    # 3. Save all results to CSV
+        embed_summaries.append(summary)
+    
+    # 3. Print combined summary table
+    print_combined_summary(conv_summaries, embed_summaries)
+    
+    # 4. Save all results to CSV
+    all_summaries = conv_summaries + embed_summaries
     write_results_to_csv(all_summaries, "experiment_results")
 
-    print("\n✅ Evaluation complete.")
+    print("\nEvaluation complete.")

@@ -572,6 +572,30 @@ def print_embedding_summary(model_id, precision, recall, f1, total_cost, total_p
     print(f"  Total cost:     ${total_cost:.6f} (for {total_pairs} pairs)")
     print(f"{'='*50}")
 
+def print_combined_summary(conv_results, embed_results):
+    """Print a combined table of all models (conversational + embedding) with cost metrics."""
+    print("\n" + "="*130)
+    print("FINAL SUMMARY: COST & PERFORMANCE (ap-southeast-2)")
+    print("="*130)
+    
+    # Conversational header
+    print(f"{'Type':<10} {'Model ID':<42} {'Succ Rate':<10} {'Correct Rate':<10} {'Avg Lat (s)':<10} {'Cost/Req':<12} {'Cost/1K':<10} {'Total Cost':<12}")
+    print("-"*130)
+    for model_id, stats in conv_results.items():
+        short_name = model_id if len(model_id) <= 42 else model_id[:39] + "..."
+        succ_rate = f"{stats['successful']}/{stats['total']}"
+        correct_rate = f"{stats['correct_count']}/{stats['total']} ({stats['correct_rate']:.1f}%)"
+        print(f"{'Conv':<10} {short_name:<42} {succ_rate:<10} {correct_rate:<10} {stats['avg_latency']:<10.4f} ${stats['avg_cost_per_req']:<11.6f} ${stats['cost_per_1k_tokens']:<9.6f} ${stats['total_cost']:<11.6f}")
+    
+    # Embedding section
+    print("-"*130)
+    print(f"{'Type':<10} {'Model ID':<42} {'Precision':<10} {'Recall':<10} {'F1':<10} {'Total Cost':<12}")
+    print("-"*130)
+    for model_id, stats in embed_results.items():
+        short_name = model_id if len(model_id) <= 42 else model_id[:39] + "..."
+        print(f"{'Embed':<10} {short_name:<42} {stats['precision']:<10.3f} {stats['recall']:<10.3f} {stats['f1']:<10.3f} ${stats['total_cost']:<11.6f}")
+    print("="*130)
+
 def save_all_results(conv_results, embed_results, conv_raw, embed_raw):
     """Save all results (conversational + embedding) to CSV in ../experiment_results/"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -680,7 +704,10 @@ def main():
             print(f"\nWaiting {MODEL_DELAY}s before next model...")
             time.sleep(MODEL_DELAY)
     
-    # 3. Save everything
+    # 3. Print combined summary table
+    print_combined_summary(conv_results, embed_results)
+    
+    # 4. Save everything
     save_all_results(conv_results, embed_results, conv_raw_data, embed_raw_data)
     print("\nEvaluation complete.")
 
