@@ -4,7 +4,7 @@ import json
 import re
 import os
 import csv
-
+import math
 from datetime import datetime
 from statistics import mean, stdev
 from typing import List, Dict, Tuple, Optional, Any
@@ -17,8 +17,8 @@ bedrock_runtime = boto3.client(service_name="bedrock-runtime", region_name="ap-s
 bedrock_management = boto3.client(service_name="bedrock", region_name="ap-southeast-2")
 
 # -----------------------------------------------------------------------------
-# 2. Pricing per 1,000 tokens (ap-southeast-2) – all models filled
-#    Sources: AWS Bedrock Pricing page (April 2026)
+# 2. Pricing per 1,000 tokens (ap-southeast-2) – all models (conversational + embedding)
+#    Sources: AWS Bedrock Pricing page (May 2026)
 # -----------------------------------------------------------------------------
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
     # Google Gemma
@@ -64,6 +64,10 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "mistral.mistral-7b-instruct-v0:2":       {"input": 0.0005, "output": 0.0015},
     "mistral.mixtral-8x7b-instruct-v0:1":     {"input": 0.0010, "output": 0.0030},
     "mistral.mistral-large-2402-v1:0":        {"input": 0.0080, "output": 0.0240},
+    # Embedding models (input only, output tokens = 0)
+    "cohere.embed-english-v3":          {"input": 0.0001, "output": 0.0},
+    "amazon.titan-embed-text-v2:0":     {"input": 0.00002, "output": 0.0},
+    "cohere.embed-multilingual-v3":     {"input": 0.0001, "output": 0.0},
 }
 # Default fallback (used if model not found – will print warning)
 DEFAULT_PRICING = {"input": 0.0010, "output": 0.0030}
@@ -74,9 +78,11 @@ EMBEDDING_MODELS = {
     "amazon.titan-embed-text-v2:0",
     "cohere.embed-multilingual-v3",
 }
+# List of embedding models to test (in addition to conversational models)
+EMBEDDING_MODEL_IDS = list(EMBEDDING_MODELS)
 
 # -----------------------------------------------------------------------------
-# 3. Model List (full)
+# 3. Model Lists (conversational)
 # -----------------------------------------------------------------------------
 MODEL_IDS: List[str] = [
     "google.gemma-3-4b-it",
@@ -119,9 +125,9 @@ MODEL_IDS: List[str] = [
 ]
 
 # -----------------------------------------------------------------------------
-# 4. Test Data – 20 queries with reference keywords and sources
+# 4. Test Data – 20 conversational queries with keywords
 # -----------------------------------------------------------------------------
-TEST_CASES = [
+CONVERSATION_TEST_CASES = [
     {"query": "What is the capital of Australia?", "keywords": ["canberra"], "source": "https://www.australia.com/en/facts-and-planning/about-australia/cities/canberra.html"},
     {"query": "Who painted the Mona Lisa?", "keywords": ["leonardo", "da vinci"], "source": "https://www.louvre.fr/en/explore/the-palace/from-the-chateau-to-the-museum-mona-lisa"},
     {"query": "If a train travels at 60 km/h for 2 hours, how far does it go?", "keywords": ["120", "km"], "source": "https://www.mathsisfun.com/measure/speed-distance-time.html"},
@@ -144,12 +150,48 @@ TEST_CASES = [
     {"query": "What is the probability of rolling a 6 on a fair die?", "keywords": ["1/6", "one sixth", "0.1667"], "source": "https://www.mathsisfun.com/data/probability.html"},
 ]
 
+# -----------------------------------------------------------------------------
+# 5. Embedding Test Pairs (20 pairs: 10 similar, 5 dissimilar, 5 negation)
+#    Each pair: (sentence_a, sentence_b, expected_similar: True/False)
+# -----------------------------------------------------------------------------
+EMBEDDING_TEST_PAIRS = [
+    # Similar pairs (semantic similarity)
+    ("A cat sleeps on the mat.", "A feline naps on the rug.", True),
+    ("Machine learning models require large amounts of data.", "Deep learning algorithms need extensive datasets.", True),
+    ("The quick brown fox jumps over the lazy dog.", "A fast brown fox leaps above a sleepy hound.", True),
+    ("She loves to travel to new places.", "She enjoys visiting unfamiliar destinations.", True),
+    ("Python is a popular programming language.", "Python is widely used for coding.", True),
+    ("The stock market experienced a downturn.", "Equities saw a significant decline.", True),
+    ("Climate change is a pressing global issue.", "Global warming is an urgent worldwide problem.", True),
+    ("The painting used vibrant colors and bold brushstrokes.", "The artwork featured bright hues and strong strokes.", True),
+    ("Yoga and meditation help reduce stress.", "Practicing mindfulness lowers anxiety.", True),
+    ("The athlete broke the world record.", "The runner shattered the global benchmark.", True),
+    
+    # Dissimilar pairs (no negation)
+    ("The sun rises in the east.", "The restaurant serves delicious pasta.", False),
+    ("How to bake a chocolate cake.", "Quantum physics explains particle behavior.", False),
+    ("The Great Wall of China is ancient.", "The new smartphone has a great camera.", False),
+    ("Space exploration leads to innovation.", "The movie had a thrilling adventure plot.", False),
+    ("Blockchain enables secure transactions.", "The novel explores themes of identity.", False),
+    
+    # Negation pairs (expected dissimilar)
+    ("The sky is blue.", "The sky is not blue.", False),
+    ("Water boils at 100 degrees Celsius.", "Water does not boil at 100 degrees Celsius.", False),
+    ("Cats are mammals.", "Cats are not mammals.", False),
+    ("The Earth orbits the Sun.", "The Earth does not orbit the Sun.", False),
+    ("Snow is white.", "Snow is not white.", False),
+]
+
+# -----------------------------------------------------------------------------
+# 6. Test Configuration
+# -----------------------------------------------------------------------------
 REQUEST_DELAY = 1.0      # seconds between requests per model
 MODEL_DELAY = 5.0        # seconds between different models
 MAX_RETRIES = 3
+COSINE_THRESHOLD = 0.5   # threshold for treating two embeddings as "similar"
 
 # -----------------------------------------------------------------------------
-# 5. Helper Functions
+# 7. Helper Functions
 # -----------------------------------------------------------------------------
 def get_model_parameter_size(model_id: str) -> str:
     """Extract parameter size from model ID (e.g., '120b' → '120B')."""
@@ -176,10 +218,9 @@ def check_model_access(model_id: str) -> Tuple[bool, Optional[str]]:
     """Check if model is accessible in the current region."""
     try:
         if model_id in EMBEDDING_MODELS:
-            # minimal embed test
             if "cohere" in model_id:
                 body = json.dumps({"texts": ["test"], "input_type": "search_query"})
-            else:  # Titan
+            else:
                 body = json.dumps({"inputText": "test"})
             bedrock_runtime.invoke_model(
                 modelId=model_id,
@@ -199,8 +240,75 @@ def check_model_access(model_id: str) -> Tuple[bool, Optional[str]]:
     except Exception as e:
         return False, str(e)
 
+def cosine_similarity(vec_a, vec_b):
+    """Compute cosine similarity between two vectors."""
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+def get_embedding(text: str, model_id: str):
+    """
+    Return embedding vector, latency, input_tokens, success, cost.
+    """
+    start = time.perf_counter()
+    try:
+        if "cohere" in model_id:
+            body = json.dumps({"texts": [text], "input_type": "search_query"})
+        else:
+            body = json.dumps({"inputText": text})
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=body
+        )
+        latency = time.perf_counter() - start
+        resp_body = json.loads(response['body'].read())
+        # Extract vector
+        if "cohere" in model_id:
+            embedding = resp_body.get('embeddings', [])[0] if resp_body.get('embeddings') else None
+        else:
+            embedding = resp_body.get('embedding')
+        # Extract input token count
+        if "amazon.titan" in model_id:
+            in_tokens = resp_body.get('inputTextTokenCount', 0)
+        elif "cohere" in model_id:
+            in_tokens = resp_body.get('meta', {}).get('billed_units', {}).get('input_tokens', 0)
+        else:
+            in_tokens = 0
+        out_tokens = 0
+        cost, in_cost, out_cost = calculate_cost(in_tokens, out_tokens, model_id)
+        return {
+            "success": True,
+            "embedding": embedding,
+            "latency_sec": latency,
+            "input_tokens": in_tokens,
+            "output_tokens": out_tokens,
+            "total_cost": cost,
+            "input_cost": in_cost,
+            "output_cost": out_cost,
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "embedding": None,
+            "latency_sec": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_cost": 0,
+            "input_cost": 0,
+            "output_cost": 0,
+            "error": str(e)
+        }
+
 def is_correct(model_answer: str, keywords: List[str]) -> bool:
-    """Check if answer contains all keywords (case‑insensitive, punctuation ignored)."""
+    """Check if conversational answer contains all keywords."""
     if not model_answer:
         return False
     cleaned = re.sub(r'[^\w\s]', '', model_answer.lower())
@@ -215,44 +323,21 @@ def is_correct(model_answer: str, keywords: List[str]) -> bool:
                 return False
     return True
 
-def invoke_bedrock(prompt: str, model_id: str) -> Dict[str, Any]:
-    """Send a single prompt, return latency, tokens, cost, answer text."""
+def invoke_conversational(prompt: str, model_id: str):
+    """Send a conversational prompt, return result dict."""
     start = time.perf_counter()
     try:
-        if model_id in EMBEDDING_MODELS:
-            # Embedding path – no output text, token count only
-            if "cohere" in model_id:
-                body = json.dumps({"texts": [prompt], "input_type": "search_query"})
-            else:
-                body = json.dumps({"inputText": prompt})
-            response = bedrock_runtime.invoke_model(
-                modelId=model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=body
-            )
-            resp_body = json.loads(response['body'].read())
-            if "amazon.titan" in model_id:
-                in_tokens = resp_body.get('inputTextTokenCount', 0)
-            elif "cohere" in model_id:
-                in_tokens = resp_body.get('meta', {}).get('billed_units', {}).get('input_tokens', 0)
-            else:
-                in_tokens = 0
-            out_tokens = 0
-            answer_text = "(embedding output omitted)"
-        else:
-            # Conversational
-            response = bedrock_runtime.converse(
-                modelId=model_id,
-                messages=[{"role": "user", "content": [{"text": prompt}]}],
-                inferenceConfig={"maxTokens": 512, "temperature": 0.5}
-            )
-            usage = response.get('usage', {})
-            in_tokens = usage.get('inputTokens', 0)
-            out_tokens = usage.get('outputTokens', 0)
-            content = response.get('output', {}).get('message', {}).get('content', [])
-            answer_text = content[0].get('text', '') if content else ''
+        response = bedrock_runtime.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 512, "temperature": 0.5}
+        )
         latency = time.perf_counter() - start
+        usage = response.get('usage', {})
+        in_tokens = usage.get('inputTokens', 0)
+        out_tokens = usage.get('outputTokens', 0)
+        content = response.get('output', {}).get('message', {}).get('content', [])
+        answer_text = content[0].get('text', '') if content else ''
         total_cost, in_cost, out_cost = calculate_cost(in_tokens, out_tokens, model_id)
         return {
             "success": True,
@@ -278,29 +363,28 @@ def invoke_bedrock(prompt: str, model_id: str) -> Dict[str, Any]:
             "error": str(e)
         }
 
-def run_test_suite(model_id: str) -> Tuple[List[Dict], int, int, float]:
-    """
-    Run all test cases against one model.
-    Returns: (list_of_results, correct_count, total_queries, total_cost)
-    """
+# -----------------------------------------------------------------------------
+# 8. Test Suites
+# -----------------------------------------------------------------------------
+def run_conversational_tests(model_id: str):
+    """Run 20 conversational test cases, return results, stats, total_cost."""
     correct = 0
     results = []
     total_cost = 0.0
-    print(f"\nTesting: {model_id} (size {get_model_parameter_size(model_id)})")
+    print(f"\nTesting Conversational Model: {model_id}")
     pricing = get_model_pricing(model_id)
-    print(f"Pricing: ${pricing['input']}/1K input, ${pricing['output']}/1K output")
-    # Access check
+    print(f"Pricing: ${pricing['input']}/1K in, ${pricing['output']}/1K out")
     accessible, err = check_model_access(model_id)
     if not accessible:
-        print(f"Model not accessible: {err}")
-        return results, 0, len(TEST_CASES), 0.0
-    print("Model accessible")
-    for idx, test in enumerate(TEST_CASES, 1):
-        print(f"Query {idx}/{len(TEST_CASES)}: {test['query'][:50]}...", end="\r")
+        print(f"Not accessible: {err}")
+        return results, 0, 0.0
+    print("Accessible")
+    for idx, test in enumerate(CONVERSATION_TEST_CASES, 1):
+        print(f"Query {idx}/{len(CONVERSATION_TEST_CASES)}: {test['query'][:50]}...", end="\r")
         attempt = 0
         res = None
         while attempt < MAX_RETRIES:
-            res = invoke_bedrock(test['query'], model_id)
+            res = invoke_conversational(test['query'], model_id)
             if res['success']:
                 break
             if "Throttling" in str(res.get('error', '')):
@@ -311,17 +395,11 @@ def run_test_suite(model_id: str) -> Tuple[List[Dict], int, int, float]:
             else:
                 break
         if res and res['success']:
-            # Evaluate correctness
             if is_correct(res['answer_text'], test['keywords']):
                 correct += 1
-            else:
-                # Optionally print mismatch for debugging (commented)
-                # print(f"\n   ✗ Expected keywords: {test['keywords']}")
-                pass
             results.append(res)
             total_cost += res['total_cost']
         else:
-            # Failed request
             results.append({
                 "success": False,
                 "query": test['query'],
@@ -329,18 +407,112 @@ def run_test_suite(model_id: str) -> Tuple[List[Dict], int, int, float]:
                 "total_cost": 0
             })
         time.sleep(REQUEST_DELAY)
-    print(f"\nCompleted. Correct: {correct}/{len(TEST_CASES)}")
-    return results, correct, len(TEST_CASES), total_cost
+    print(f"\nCompleted. Correct: {correct}/{len(CONVERSATION_TEST_CASES)}")
+    return results, correct, total_cost
 
-def aggregate_stats(results: List[Dict], correct_count: int, total_queries: int) -> Dict[str, Any]:
-    """Compute aggregated stats including correctness, latency, tokens, cost."""
+def run_embedding_tests(model_id: str, test_pairs):
+    """
+    Run embedding similarity test.
+    Returns: (list of detailed results, precision, recall, f1, total_cost)
+    """
+    results = []
+    tp = fp = tn = fn = 0
+    total_cost = 0.0
+    print(f"\nTesting Embedding Model: {model_id}")
+    pricing = get_model_pricing(model_id)
+    print(f"   Pricing: ${pricing['input']}/1K input (output free)")
+    accessible, err = check_model_access(model_id)
+    if not accessible:
+        print(f"Not accessible: {err}")
+        return results, 0.0, 0.0, 0.0, 0.0
+    print("Accessible")
+    for idx, (sent_a, sent_b, expected_similar) in enumerate(test_pairs, 1):
+        print(f"   Pair {idx}/{len(test_pairs)}: {sent_a[:40]}... vs {sent_b[:40]}...", end="\r")
+        # Get embedding A
+        attempt_a = 0
+        res_a = None
+        while attempt_a < MAX_RETRIES:
+            res_a = get_embedding(sent_a, model_id)
+            if res_a['success']:
+                break
+            if "Throttling" in str(res_a.get('error', '')):
+                wait = (2 ** attempt_a) * 2
+                print(f"\nThrottled, waiting {wait}s...")
+                time.sleep(wait)
+                attempt_a += 1
+            else:
+                break
+        # Get embedding B
+        attempt_b = 0
+        res_b = None
+        while attempt_b < MAX_RETRIES:
+            res_b = get_embedding(sent_b, model_id)
+            if res_b['success']:
+                break
+            if "Throttling" in str(res_b.get('error', '')):
+                wait = (2 ** attempt_b) * 2
+                print(f"\nThrottled, waiting {wait}s...")
+                time.sleep(wait)
+                attempt_b += 1
+            else:
+                break
+        if res_a and res_a['success'] and res_b and res_b['success']:
+            sim = cosine_similarity(res_a['embedding'], res_b['embedding'])
+            predicted_similar = sim > COSINE_THRESHOLD
+            correct = (predicted_similar == expected_similar)
+            # Update confusion matrix
+            if predicted_similar and expected_similar:
+                tp += 1
+            elif predicted_similar and not expected_similar:
+                fp += 1
+            elif not predicted_similar and not expected_similar:
+                tn += 1
+            elif not predicted_similar and expected_similar:
+                fn += 1
+            # Aggregate cost (both calls)
+            pair_cost = res_a['total_cost'] + res_b['total_cost']
+            total_cost += pair_cost
+            results.append({
+                "success": True,
+                "sentence_a": sent_a,
+                "sentence_b": sent_b,
+                "expected_similar": expected_similar,
+                "cosine_sim": sim,
+                "predicted_similar": predicted_similar,
+                "correct": correct,
+                "latency_a": res_a['latency_sec'],
+                "latency_b": res_b['latency_sec'],
+                "tokens_a": res_a['input_tokens'],
+                "tokens_b": res_b['input_tokens'],
+                "cost_a": res_a['total_cost'],
+                "cost_b": res_b['total_cost']
+            })
+        else:
+            results.append({
+                "success": False,
+                "sentence_a": sent_a,
+                "sentence_b": sent_b,
+                "error_a": res_a.get('error') if res_a else "No response",
+                "error_b": res_b.get('error') if res_b else "No response"
+            })
+        time.sleep(REQUEST_DELAY)
+    # Compute precision, recall, F1
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    print(f"\nCompleted. Precision={precision:.3f}, Recall={recall:.3f}, F1={f1:.3f}")
+    return results, precision, recall, f1, total_cost
+
+# -----------------------------------------------------------------------------
+# 9. Aggregation and Output
+# -----------------------------------------------------------------------------
+def aggregate_conversational_stats(results, correct_count, total_queries):
     successful = [r for r in results if r.get('success', False)]
     if not successful:
-        # No successful requests – return zeros but keep correctness info
         return {
             "success_rate": 0.0,
             "correct_rate": (correct_count / total_queries) * 100,
-            "correct_count": correct_count,          # <-- ADDED
+            "correct_count": correct_count,
             "avg_latency": 0.0,
             "min_latency": 0.0,
             "max_latency": 0.0,
@@ -366,7 +538,7 @@ def aggregate_stats(results: List[Dict], correct_count: int, total_queries: int)
     return {
         "success_rate": len(successful) / len(results) * 100,
         "correct_rate": (correct_count / total_queries) * 100,
-        "correct_count": correct_count,              # <-- ADDED (already present here)
+        "correct_count": correct_count,
         "avg_latency": mean(latencies),
         "min_latency": min(latencies),
         "max_latency": max(latencies),
@@ -379,81 +551,137 @@ def aggregate_stats(results: List[Dict], correct_count: int, total_queries: int)
         "total_tokens": total_tokens
     }
 
+def print_conversational_summary(model_id, stats):
+    print(f"\n{'='*50}")
+    print(f"CONVERSATIONAL MODEL: {model_id}")
+    print(f"  Parameter size: {get_model_parameter_size(model_id)}")
+    print(f"  Success rate:   {stats['success_rate']:.1f}% ({stats['successful']}/{stats['total']})")
+    print(f"  Correct rate:   {stats['correct_rate']:.1f}% ({stats['correct_count']}/{stats['total']})")
+    print(f"  Avg latency:    {stats['avg_latency']:.4f} s")
+    print(f"  Min latency:    {stats['min_latency']:.4f} s")
+    print(f"  Max latency:    {stats['max_latency']:.4f} s")
+    print(f"  Total cost:     ${stats['total_cost']:.6f}")
+    print(f"{'='*50}")
 
-def print_final_table(all_stats: Dict[str, Dict[str, Any]]):
-    """Print a compact comparison table."""
-    print("\n" + "="*130)
-    print("FINAL COMPARISON TABLE (ap-southeast-2)")
-    print("="*130)
-    header = (f"{'Model':<45} {'Size':<6} {'Correct':<9} {'Latency(avg)':<12} "
-              f"{'TPS':<8} {'Cost/Req':<12} {'Cost/1K':<12} {'Success':<8}")
-    print(header)
-    print("-"*130)
-    for model_id, stats in sorted(all_stats.items(), key=lambda x: x[1]['correct_rate'], reverse=True):
-        short_name = model_id if len(model_id) <= 44 else model_id[:41] + "..."
-        correct_str = f"{stats['correct_count']}/20 ({stats['correct_rate']:.0f}%)"
-        succ_str = f"{stats['success_rate']:.0f}%"
-        print(f"{short_name:<45} {get_model_parameter_size(model_id):<6} {correct_str:<9} "
-              f"{stats['avg_latency']:<12.3f} {stats['tokens_per_second']:<8.1f} "
-              f"${stats['avg_cost_per_req']:<11.6f} ${stats['cost_per_1k_tokens']:<11.6f} {succ_str:<8}")
-    print("="*130)
+def print_embedding_summary(model_id, precision, recall, f1, total_cost, total_pairs):
+    print(f"\n{'='*50}")
+    print(f"EMBEDDING MODEL: {model_id}")
+    print(f"  Precision:      {precision:.3f}")
+    print(f"  Recall:         {recall:.3f}")
+    print(f"  F1 Score:       {f1:.3f}")
+    print(f"  Total cost:     ${total_cost:.6f} (for {total_pairs} pairs)")
+    print(f"{'='*50}")
 
-def save_full_results(all_raw: Dict[str, List[Dict]], all_stats: Dict[str, Dict[str, Any]]):
-    """Save per‑request details and aggregated summary to CSV in ../experiment_results/"""
+def save_all_results(conv_results, embed_results, conv_raw, embed_raw):
+    """Save all results (conversational + embedding) to CSV in ../experiment_results/"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(script_dir)
     out_dir = os.path.join(parent_dir, "experiment_results")
     os.makedirs(out_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"bedrock_full_evaluation_{timestamp}.csv"
+    filename = f"multi_model_evaluation_{timestamp}.csv"
     filepath = os.path.join(out_dir, filename)
     with open(filepath, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["model_id", "query_id", "success", "latency_sec", "input_tokens",
-                         "output_tokens", "input_cost", "output_cost", "total_cost", "error"])
-        for model_id, results in all_raw.items():
-            for i, r in enumerate(results, 1):
-                writer.writerow([
-                    model_id, i, r.get('success', False),
-                    round(r.get('latency_sec', 0), 4),
-                    r.get('input_tokens', 0), r.get('output_tokens', 0),
-                    round(r.get('input_cost', 0), 8), round(r.get('output_cost', 0), 8),
-                    round(r.get('total_cost', 0), 8), r.get('error', '')
-                ])
-        # Append summary rows
-        writer.writerow([])
-        writer.writerow(["SUMMARY_PER_MODEL"])
-        writer.writerow(["model_id", "param_size", "success_rate%", "correct_rate%",
-                         "avg_latency", "min_latency", "max_latency", "total_cost_usd",
-                         "avg_cost_per_req", "cost_per_1k_tokens", "tokens_per_second"])
-        for model_id, s in all_stats.items():
+        writer.writerow(["Model Type", "Model ID", "Param Size", "Success Rate", "Correct Rate / F1",
+                         "Avg Latency (s)", "Min Latency (s)", "Max Latency (s)",
+                         "Total Input Tokens", "Total Output Tokens", "Total Cost (USD)"])
+        # Conversational summaries
+        for model_id, stats in conv_results.items():
             writer.writerow([
-                model_id, get_model_parameter_size(model_id), f"{s['success_rate']:.1f}",
-                f"{s['correct_rate']:.1f}", f"{s['avg_latency']:.4f}", f"{s['min_latency']:.4f}",
-                f"{s['max_latency']:.4f}", f"{s['total_cost']:.6f}", f"{s['avg_cost_per_req']:.8f}",
-                f"{s['cost_per_1k_tokens']:.6f}", f"{s['tokens_per_second']:.2f}"
+                "Conversational", model_id, stats.get("param_size", "N/A"),
+                f"{stats['success_rate']:.1f}%", f"{stats['correct_rate']:.1f}%",
+                f"{stats['avg_latency']:.4f}", f"{stats['min_latency']:.4f}", f"{stats['max_latency']:.4f}",
+                stats.get("total_input_tokens", 0), stats.get("total_output_tokens", 0),
+                f"{stats['total_cost']:.6f}"
             ])
-    print(f"\nFull results (per‑request + summary) saved to: {filepath}")
+        # Embedding summaries
+        for model_id, stats in embed_results.items():
+            writer.writerow([
+                "Embedding", model_id, "N/A",
+                "N/A", f"F1={stats['f1']:.3f}",
+                "N/A", "N/A", "N/A",
+                "N/A", "N/A", f"{stats['total_cost']:.6f}"
+            ])
+        writer.writerow([])
+        writer.writerow(["DETAILED PER-REQUEST (Conversational)"])
+        writer.writerow(["Model ID", "Query", "Success", "Latency (s)", "Input Tokens", "Output Tokens",
+                         "Total Cost", "Correct"])
+        for model_id, reqs in conv_raw.items():
+            for r in reqs:
+                writer.writerow([
+                    model_id, r.get('query', '')[:100], r.get('success', False),
+                    round(r.get('latency_sec', 0), 4), r.get('input_tokens', 0), r.get('output_tokens', 0),
+                    round(r.get('total_cost', 0), 8), r.get('correct', False)
+                ])
+        writer.writerow([])
+        writer.writerow(["DETAILED PER-PAIR (Embedding)"])
+        writer.writerow(["Model ID", "Sentence A", "Sentence B", "Expected", "Cosine Sim", "Predicted",
+                         "Correct", "Latency A", "Latency B", "Tokens A", "Tokens B", "Cost A", "Cost B"])
+        for model_id, pairs in embed_raw.items():
+            for p in pairs:
+                if p.get('success'):
+                    writer.writerow([
+                        model_id, p['sentence_a'][:80], p['sentence_b'][:80], p['expected_similar'],
+                        f"{p['cosine_sim']:.4f}", p['predicted_similar'], p['correct'],
+                        f"{p['latency_a']:.4f}", f"{p['latency_b']:.4f}",
+                        p['tokens_a'], p['tokens_b'], f"{p['cost_a']:.8f}", f"{p['cost_b']:.8f}"
+                    ])
+                else:
+                    writer.writerow([model_id, p['sentence_a'][:80], p['sentence_b'][:80], "ERROR", "", "", "", "", "", "", "", "", ""])
+    print(f"\nFull results saved to: {filepath}")
 
+# -----------------------------------------------------------------------------
+# 10. Main Execution
+# -----------------------------------------------------------------------------
 def main():
-    print("\nAWS Bedrock Model Evaluation (Latency, Cost, Correctness)")
-    print(f"   Region: ap-southeast-2 | Models: {len(MODEL_IDS)} | Queries: {len(TEST_CASES)}")
-    all_raw = {}
-    all_stats = {}
-    total_test_cost = 0.0
-    for idx, model_id in enumerate(MODEL_IDS, 1):
-        results, correct, total_q, model_cost = run_test_suite(model_id)
-        all_raw[model_id] = results
-        stats = aggregate_stats(results, correct, total_q)
-        all_stats[model_id] = stats
-        total_test_cost += model_cost
-        if idx < len(MODEL_IDS):
-            print(f"\n Waiting {MODEL_DELAY}s before next model...")
+    print("\n" + "="*70)
+    print("AWS BEDROCK MULTI-MODEL EVALUATION (Conversational + Embedding)")
+    print("Region: ap-southeast-2")
+    print("="*70)
+    
+    # 1. Test conversational models
+    print("\n" + "="*70)
+    print("PHASE 1: CONVERSATIONAL MODELS")
+    print("="*70)
+    conv_results = {}
+    conv_raw_data = {}
+    for model_id in MODEL_IDS:
+        results, correct, total_cost = run_conversational_tests(model_id)
+        conv_raw_data[model_id] = results
+        stats = aggregate_conversational_stats(results, correct, len(CONVERSATION_TEST_CASES))
+        stats["param_size"] = get_model_parameter_size(model_id)
+        stats["total"] = len(CONVERSATION_TEST_CASES)
+        stats["successful"] = len([r for r in results if r.get('success')])
+        conv_results[model_id] = stats
+        print_conversational_summary(model_id, stats)
+        if model_id != MODEL_IDS[-1]:
+            print(f"\nWaiting {MODEL_DELAY}s before next model...")
             time.sleep(MODEL_DELAY)
-    print_final_table(all_stats)
-    print(f"\n Total estimated test cost: ${total_test_cost:.6f}")
-    print("Note: Costs are estimates based on AWS Bedrock pricing (ap-southeast-2).")
-    save_full_results(all_raw, all_stats)
+    
+    # 2. Test embedding models
+    print("\n" + "="*70)
+    print("PHASE 2: EMBEDDING MODELS (Semantic Similarity)")
+    print("="*70)
+    embed_results = {}
+    embed_raw_data = {}
+    for model_id in EMBEDDING_MODEL_IDS:
+        results, prec, rec, f1, total_cost = run_embedding_tests(model_id, EMBEDDING_TEST_PAIRS)
+        embed_raw_data[model_id] = results
+        embed_results[model_id] = {
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "total_cost": total_cost,
+            "total_pairs": len(EMBEDDING_TEST_PAIRS)
+        }
+        print_embedding_summary(model_id, prec, rec, f1, total_cost, len(EMBEDDING_TEST_PAIRS))
+        if model_id != EMBEDDING_MODEL_IDS[-1]:
+            print(f"\nWaiting {MODEL_DELAY}s before next model...")
+            time.sleep(MODEL_DELAY)
+    
+    # 3. Save everything
+    save_all_results(conv_results, embed_results, conv_raw_data, embed_raw_data)
     print("\nEvaluation complete.")
 
 if __name__ == "__main__":
