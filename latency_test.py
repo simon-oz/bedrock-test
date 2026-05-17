@@ -141,9 +141,47 @@ def get_model_parameter_size(model_id: str) -> str:
     return "N/A"
 
 def invoke_conversational_model(prompt: str, model_id: str):
-    """Send a conversational prompt via Bedrock converse API."""
+    """
+    Send a conversational prompt via Bedrock.
+    Uses the converse API for most models, but for OpenAI GPT-OSS models
+    we use invoke_model with an OpenAI-compatible chat payload.
+    """
     start_time = time.perf_counter()
     try:
+        # --- For OpenAI GPT-OSS models (and any future OpenAI-like models) ---
+        if model_id.startswith("openai.gpt-oss"):
+            body = json.dumps({
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 512,
+                "temperature": 0.5
+            })
+            response = bedrock_runtime.invoke_model(
+                modelId=model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=body
+            )
+            duration = time.perf_counter() - start_time
+            response_body = json.loads(response["body"].read())
+            # Extract answer text from choices list
+            answer_text = ""
+            choices = response_body.get("choices", [])
+            if choices and "message" in choices[0]:
+                answer_text = choices[0]["message"]["content"].strip()
+            # Extract token usage (OpenAI style)
+            usage = response_body.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            return {
+                "success": True,
+                "latency_sec": duration,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "answer_text": answer_text,
+                "error": None
+            }
+
+        # --- Default: use Bedrock converse API ---
         response = bedrock_runtime.converse(
             modelId=model_id,
             messages=[{"role": "user", "content": [{"text": prompt}]}],
@@ -479,13 +517,17 @@ def print_combined_summary(conv_summaries, embed_summaries):
     print(f"{'Type':<12} {'Model ID':<40} {'Succ Rate':<10} {'Correct Rate':<12} {'Avg Lat (s)':<12} {'In Tokens':<10} {'Out Tokens':<10}")
     print("-"*110)
     for s in conv_summaries:
-        print(f"{'Conv':<12} {s['model_id']:<40} {s['successful']}/{s['total']:<9} {s['correct']}/{s['total']} ({s['correct_rate']:.1f}%)   {s['avg_latency']:<12.4f} {s['total_input_tokens']:<10} {s['total_output_tokens']:<10}")
+        # Format avg_latency, handling None
+        avg_lat_str = f"{s['avg_latency']:<12.4f}" if s['avg_latency'] is not None else f"{'N/A':<12}"
+        print(f"{'Conv':<12} {s['model_id']:<40} {s['successful']}/{s['total']:<9} {s['correct']}/{s['total']} ({s['correct_rate']:.1f}%)   {avg_lat_str} {s['total_input_tokens']:<10} {s['total_output_tokens']:<10}")
     # Embedding header
     print("-"*110)
     print(f"{'Type':<12} {'Model ID':<40} {'Succ Rate':<10} {'Similarity Acc':<14} {'Avg Lat (s)':<12} {'In Tokens':<10}")
     print("-"*110)
     for e in embed_summaries:
-        print(f"{'Embed':<12} {e['model_id']:<40} {e['successful']}/{e['total']:<9} {e['similarity_accuracy']:.1f}% ({e['correct_pairs']}/{e['total']})   {e['avg_latency']:<12.4f} {e['total_input_tokens']:<10}")
+        # Format avg_latency, handling None
+        avg_lat_str = f"{e['avg_latency']:<12.4f}" if e['avg_latency'] is not None else f"{'N/A':<12}"
+        print(f"{'Embed':<12} {e['model_id']:<40} {e['successful']}/{e['total']:<9} {e['similarity_accuracy']:.1f}% ({e['correct_pairs']}/{e['total']})   {avg_lat_str} {e['total_input_tokens']:<10}")
     print("="*110)
 
 def write_results_to_csv(all_summaries, folder_name="experiment_results"):

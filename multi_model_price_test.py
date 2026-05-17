@@ -324,7 +324,7 @@ def is_correct(model_answer: str, keywords: List[str]) -> bool:
     return True
 
 def invoke_conversational(prompt: str, model_id: str):
-    """Send a conversational prompt, return result dict."""
+    """Send a conversational prompt, return result dict with robust answer extraction."""
     start = time.perf_counter()
     try:
         response = bedrock_runtime.converse(
@@ -336,8 +336,42 @@ def invoke_conversational(prompt: str, model_id: str):
         usage = response.get('usage', {})
         in_tokens = usage.get('inputTokens', 0)
         out_tokens = usage.get('outputTokens', 0)
-        content = response.get('output', {}).get('message', {}).get('content', [])
-        answer_text = content[0].get('text', '') if content else ''
+        
+        # --- Robust answer extraction ---
+        answer_text = ""
+        # 1) Standard Bedrock converse format
+        if 'output' in response and 'message' in response['output']:
+            content = response['output']['message'].get('content', [])
+            if content and 'text' in content[0]:
+                answer_text = content[0]['text'].strip()
+        # 2) OpenAI / GPT‑OSS format (choices array)
+        if not answer_text and 'choices' in response:
+            choices = response.get('choices', [])
+            if choices and 'message' in choices[0]:
+                msg = choices[0]['message']
+                if isinstance(msg, dict):
+                    answer_text = msg.get('content', '').strip()
+                elif isinstance(msg, str):
+                    answer_text = msg.strip()
+        # 3) Fallback: try to find any text field
+        if not answer_text:
+            # Recursively search for first "text" key
+            def find_text(obj):
+                if isinstance(obj, dict):
+                    if 'text' in obj and isinstance(obj['text'], str):
+                        return obj['text']
+                    for v in obj.values():
+                        result = find_text(v)
+                        if result:
+                            return result
+                elif isinstance(obj, list):
+                    for item in obj:
+                        result = find_text(item)
+                        if result:
+                            return result
+                return None
+            answer_text = find_text(response) or ""
+        
         total_cost, in_cost, out_cost = calculate_cost(in_tokens, out_tokens, model_id)
         return {
             "success": True,
@@ -362,7 +396,7 @@ def invoke_conversational(prompt: str, model_id: str):
             "answer_text": "",
             "error": str(e)
         }
-
+    
 # -----------------------------------------------------------------------------
 # 8. Test Suites
 # -----------------------------------------------------------------------------
@@ -385,6 +419,9 @@ def run_conversational_tests(model_id: str):
         res = None
         while attempt < MAX_RETRIES:
             res = invoke_conversational(test['query'], model_id)
+            # For debugging purpose
+            if "gpt-oss" in model_id and idx == 1:
+                print(f"\n[DEBUG] {model_id} answer (first 200 chars): {res['answer_text'][:200]}")
             if res['success']:
                 break
             if "Throttling" in str(res.get('error', '')):
