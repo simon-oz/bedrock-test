@@ -24,11 +24,12 @@ All results are automatically saved as CSV files in the `experiment_results/` fo
 ```bash
 # Clone or download the scripts into a directory, e.g., boto3-test/
 cd boto3-test
+```
 
-# Install required packages
+## Install required packages
 pip install -r requirements.txt
 
-## Script Overview
+### Script Overview
 1. boto_test.py – Basic Embedding Example
 A minimal script to demonstrate how to call Bedrock embedding models (cohere.embed-english-v3, amazon.titan-embed-text-v2:0, cohere.embed-multilingual-v3) and print the resulting embedding vector (first 10 values) and input token count.
 
@@ -37,7 +38,7 @@ A minimal script to demonstrate how to call Bedrock embedding models (cohere.emb
 ```bash
 python boto_test.py
 Output: Prints the embedding dimension, token count, and first 10 values for each embedding model.
-
+```
 ## 2. latency_test.py – Latency & Token Usage (No Cost)
 Tests all conversational models (39 models) on 20 factual and reasoning questions, and three embedding models on 20 sentence‑pair similarity tasks.
 ### Metrics measured:
@@ -62,7 +63,7 @@ Tests all conversational models (39 models) on 20 factual and reasoning question
 
 ```bash
 python latency_test.py
-
+```
 ## 3. multi_model_price_test.py – Full Evaluation with Cost Estimation
 Combines conversational and embedding tests with AWS Bedrock pricing (ap-southeast-2).
 
@@ -82,7 +83,7 @@ Detailed CSV: ./experiment_results/multi_model_evaluation_<timestamp>.csv
 ```bash
 python multi_model_price_test.py
 Note: Prices are estimates based on AWS public pricing as of May 2026. Verify on the AWS Bedrock Pricing page.
-
+```
 ## 4. gpt_oss_safeguard_test.py – Safety Guardrail Evaluation
 Evaluates openai.gpt-oss-safeguard-120b and -20b models on 10+ risk categories (spam, prompt injection, harmful instructions, jailbreak, self‑harm, fraud, multilingual harm, etc.).
 ### Uses the correct policy for each category (spam policy, injection policy, harm policy).
@@ -98,7 +99,7 @@ Reports per‑category accuracy, overall accuracy, adversarial refusal rate, rea
 
 ```bash
 python gpt_oss_safeguard_test.py
-
+```
 ## Important Notes
 All scripts use the region ap-southeast-2 (Sydney). Ensure your models are enabled there.
 
