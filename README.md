@@ -21,8 +21,8 @@ All results are automatically saved as CSV files in the `experiment_results/` fo
 
 ### Installation
 
-```bash
 # Clone or download the scripts into a directory, e.g., boto3-test/
+```bash
 cd boto3-test
 ```
 
@@ -37,8 +37,9 @@ A minimal script to demonstrate how to call Bedrock embedding models (cohere.emb
 
 ```bash
 python boto_test.py
-Output: Prints the embedding dimension, token count, and first 10 values for each embedding model.
 ```
+Output: Prints the embedding dimension, token count, and first 10 values for each embedding model.
+
 ## 2. latency_test.py – Latency & Token Usage (No Cost)
 Tests all conversational models (39 models) on 20 factual and reasoning questions, and three embedding models on 20 sentence‑pair similarity tasks.
 ### Metrics measured:
@@ -82,8 +83,9 @@ Detailed CSV: ./experiment_results/multi_model_evaluation_<timestamp>.csv
 
 ```bash
 python multi_model_price_test.py
-Note: Prices are estimates based on AWS public pricing as of May 2026. Verify on the AWS Bedrock Pricing page.
 ```
+Note: Prices are estimates based on AWS public pricing as of May 2026. Verify on the AWS Bedrock Pricing page.
+
 ## 4. gpt_oss_safeguard_test.py – Safety Guardrail Evaluation
 Evaluates openai.gpt-oss-safeguard-120b and -20b models on 10+ risk categories (spam, prompt injection, harmful instructions, jailbreak, self‑harm, fraud, multilingual harm, etc.).
 ### Uses the correct policy for each category (spam policy, injection policy, harm policy).
